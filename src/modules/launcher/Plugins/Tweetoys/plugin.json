@@ -1,0 +1,13 @@
+{
+  "ID": "otintinTweetoys",
+  "ActionKeyword": ":",
+  "IsGlobal": false,
+  "Name": "Tweetoys",
+  "Author": "qianlifeng",
+  "Version": "1.0.0",
+  "Language": "csharp",
+  "Website": "https://aka.ms/powertoys",
+  "ExecuteFileName": "Tweetoys.dll",
+  "IcoPathDark": "Images\\shell.dark.png",
+  "IcoPathLight": "Images\\shell.light.png"
+}
