@@ -18,6 +18,14 @@ namespace Tweetoys
 
         public bool RunAsAdministrator { get; set; }
 
+        public string CONSUMERKEY { get; set; }
+
+        public string CONSUMERSECRET { get; set; }
+
+        public string ACCESSTOKEN { get; set; }
+
+        public string ACCESSTOKENSECRET { get; set; }
+
         public Dictionary<string, int> Count { get; } = new Dictionary<string, int>();
 
         public void AddCmdHistory(string cmdName)

@@ -13,6 +13,7 @@ using System.Linq;
 using System.Reflection;
 using System.Windows.Input;
 using ManagedCommon;
+using Microsoft.PowerToys.Settings.UI.Library;
 using Wox.Infrastructure.Storage;
 using Wox.Plugin;
 using Wox.Plugin.Logger;
@@ -37,12 +38,30 @@ namespace Tweetoys
 
         public string Description => Properties.Resources.wox_plugin_cmd_plugin_description;
 
+        private const string Enabletweetkun = nameof(Enabletweetkun);
+
+        // private CoreTweet.Tokens tokens;
         private PluginInitContext _context;
+
+        private bool isenabledkun;
 
         public Main()
         {
             _storage = new PluginJsonStorage<TweetoysPluginSettings>();
             _settings = _storage.Load();
+            isenabledkun = true;
+            try
+            {
+                // twc = new TwitterClient(consumerKey: _settings.CONSUMERKEY, consumerSecret: _settings.CONSUMERSECRET, accessSecret: _settings.ACCESSTOKENSECRET, accessToken: _settings.ACCESSTOKEN);
+                // tokens = CoreTweet.Tokens.Create(_settings.CONSUMERKEY, _settings.CONSUMERSECRET, _settings.ACCESSTOKEN, _settings.ACCESSTOKENSECRET);
+                // twapi = new TwitterApi(_settings.CONSUMERKEY, _settings.CONSUMERSECRET, _settings.ACCESSTOKEN, _settings.ACCESSTOKENSECRET);
+            }
+#pragma warning disable CA1031 // 一般的な例外の種類はキャッチしません
+            catch (Exception)
+#pragma warning restore CA1031 // 一般的な例外の種類はキャッチしません
+            {
+                isenabledkun = false;
+            }
         }
 
         public void Save()
@@ -126,8 +145,16 @@ namespace Tweetoys
                 IcoPath = IconPath,
                 Action = c =>
                 {
-                    // Execute(Process.Start, PrepareProcessStartInfo(cmd));
-                    System.Windows.MessageBox.Show(cmd, "Cpa");
+                    if (isenabledkun)
+                    {
+                        // tokens.Statuses.Update(status => cmd);
+                        var app = new ProcessStartInfo();
+                        app.Arguments = "\"" + _settings.CONSUMERKEY + "\" \"" + _settings.CONSUMERSECRET + "\" \"" + _settings.ACCESSTOKEN + "\" \"" + _settings.ACCESSTOKENSECRET + "\" " +
+                         cmd + "\"";
+                        app.FileName = System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) + "\\tweetmodule.exe";
+                        Process.Start(app);
+                    }
+
                     return true;
                 },
             };
