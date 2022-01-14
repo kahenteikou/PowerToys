@@ -152,6 +152,7 @@ namespace Tweetoys
                         app.Arguments = "\"" + _settings.CONSUMERKEY + "\" \"" + _settings.CONSUMERSECRET + "\" \"" + _settings.ACCESSTOKEN + "\" \"" + _settings.ACCESSTOKENSECRET + "\" " +
                          cmd + "\"";
                         app.FileName = System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) + "\\tweetmodule.exe";
+                        app.CreateNoWindow = true;
                         Process.Start(app);
                     }
 

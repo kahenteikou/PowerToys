@@ -88,7 +88,7 @@ namespace Tweetoys.Properties {
         }
         
         /// <summary>
-        ///   execute command through command shell に類似しているローカライズされた文字列を検索します。
+        ///   Tweet に類似しているローカライズされた文字列を検索します。
         /// </summary>
         public static string wox_plugin_cmd_execute_through_shell {
             get {
@@ -97,7 +97,7 @@ namespace Tweetoys.Properties {
         }
         
         /// <summary>
-        ///   Executes commands (e.g &apos;ping&apos;, &apos;cmd&apos;). に類似しているローカライズされた文字列を検索します。
+        ///   Tweet に類似しているローカライズされた文字列を検索します。
         /// </summary>
         public static string wox_plugin_cmd_plugin_description {
             get {
