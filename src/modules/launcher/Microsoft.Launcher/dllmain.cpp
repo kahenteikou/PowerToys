@@ -14,6 +14,7 @@
 #include <common/utils/winapi_error.h>
 
 #include <filesystem>
+#include <mutex>
 
 namespace
 {
@@ -25,6 +26,7 @@ namespace
     const wchar_t JSON_KEY_SHIFT[] = L"shift";
     const wchar_t JSON_KEY_CODE[] = L"code";
     const wchar_t JSON_KEY_OPEN_POWERLAUNCHER[] = L"open_powerlauncher";
+    const wchar_t JSON_KEY_USE_CENTRALIZED_KEYBOARD_HOOK[] = L"use_centralized_keyboard_hook";
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
@@ -59,8 +61,9 @@ private:
     // Load initial settings from the persisted values.
     void init_settings();
 
-    // Handle to launch and terminate the launcher
-    HANDLE m_hProcess;
+    bool processStarting = false;
+    std::mutex processStartingMutex;
+    bool processStarted = false;
 
     //contains the name of the powerToys
     std::wstring app_name;
@@ -74,11 +77,15 @@ private:
     // Hotkey to invoke the module
     Hotkey m_hotkey = { .key = 0 };
 
+    // If the centralized keyboard hook should be used to activate PowerToys Run
+    bool m_use_centralized_keyboard_hook = false;
+
     // Helper function to extract the hotkey from the settings
     void parse_hotkey(PowerToysSettings::PowerToyValues& settings);
 
     // Handle to event used to invoke the Runner
     HANDLE m_hEvent;
+    HANDLE m_hCentralizedKeyboardHookEvent;
 
     HANDLE send_telemetry_event;
 
@@ -116,16 +123,14 @@ public:
         init_settings();
 
         m_hEvent = CreateDefaultEvent(CommonSharedConstants::POWER_LAUNCHER_SHARED_EVENT);
+        m_hCentralizedKeyboardHookEvent = CreateDefaultEvent(CommonSharedConstants::POWER_LAUNCHER_CENTRALIZED_HOOK_SHARED_EVENT);
+
         send_telemetry_event = CreateDefaultEvent(CommonSharedConstants::RUN_SEND_SETTINGS_TELEMETRY_EVENT);
     };
 
     ~Microsoft_Launcher()
     {
         Logger::info("Launcher object is destroying");
-        if (m_enabled)
-        {
-            terminateProcess();
-        }
         m_enabled = false;
     }
 
@@ -202,8 +207,26 @@ public:
     // Enable the powertoy
     virtual void enable()
     {
-        Logger::info("Microsoft_Launcher::enable()");
-        ResetEvent(m_hEvent);
+        Logger::info("Microsoft_Launcher::enable() begin");
+
+        // This synchronization code is here since we've seen logs of this function being entered twice in the same process/thread pair.
+        // The theory here is that the call to ShellExecuteExW might be enabling some context switching that allows the low level keyboard hook to be run.
+        // Ref: https://github.com/microsoft/PowerToys/issues/12908#issuecomment-986995633
+        // We want only one instance to be started at the same time.
+        processStartingMutex.lock();
+        if (processStarting)
+        {
+            processStartingMutex.unlock();
+            Logger::warn(L"Two PowerToys Run processes were trying to get started at the same time.");
+            return;
+        }
+        else
+        {
+            processStarting = true;
+            processStartingMutex.unlock();
+        }
+
+        ResetEvent(m_hCentralizedKeyboardHookEvent);
         ResetEvent(send_telemetry_event);
 
         unsigned long powertoys_pid = GetCurrentProcessId();
@@ -214,19 +237,18 @@ public:
             std::wstring executable_args;
             executable_args += L" -powerToysPid ";
             executable_args += std::to_wstring(powertoys_pid);
-            executable_args += L" --centralized-kb-hook";
+            executable_args += L" --started-from-runner";
 
             SHELLEXECUTEINFOW sei{ sizeof(sei) };
             sei.fMask = { SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI };
-            sei.lpFile = L"modules\\launcher\\PowerLauncher.exe";
+            sei.lpFile = L"modules\\launcher\\PowerToys.PowerLauncher.exe";
             sei.nShow = SW_SHOWNORMAL;
             sei.lpParameters = executable_args.data();
 
             if (ShellExecuteExW(&sei))
             {
-                m_enabled = true;
-                m_hProcess = sei.hProcess;
-                Logger::trace("Started PowerToys Run. Handle {}", m_hProcess);
+                processStarted = true;
+                Logger::trace("Started PowerToys Run");
             }
             else
             {
@@ -236,56 +258,35 @@ public:
         else
         {
             Logger::trace("Starting PowerToys Run from elevated process");
-            std::wstring action_runner_path = get_module_folderpath();
-
+            std::wstring runExecutablePath = get_module_folderpath();
             std::wstring params;
-            params += L"-run-non-elevated ";
-            params += L"-target modules\\launcher\\PowerLauncher.exe ";
-            params += L"-pidFile ";
-            params += POWER_LAUNCHER_PID_SHARED_FILE;
             params += L" -powerToysPid " + std::to_wstring(powertoys_pid) + L" ";
-            params += L"--centralized-kb-hook ";
-
-            action_runner_path += L"\\PowerToys.ActionRunner.exe";
-            // Set up the shared file from which to retrieve the PID of PowerLauncher
-            HANDLE hMapFile = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(DWORD), POWER_LAUNCHER_PID_SHARED_FILE);
-            if (!hMapFile)
+            params += L"--started-from-runner ";
+            runExecutablePath += L"\\modules\\launcher\\PowerToys.PowerLauncher.exe";
+            if (RunNonElevatedEx(runExecutablePath, params))
             {
-                auto err = get_last_error_message(GetLastError());
-                Logger::error(L"Failed to create FileMapping {}. {}", POWER_LAUNCHER_PID_SHARED_FILE, err.has_value() ? err.value() : L"");
-                return;
+                processStarted = true;
+                Logger::trace(L"The process started successfully");
             }
-
-            PDWORD pidBuffer = reinterpret_cast<PDWORD>(MapViewOfFile(hMapFile, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(DWORD)));
-            if (pidBuffer)
+            else
             {
-                *pidBuffer = 0;
-                m_hProcess = NULL;
-
-                if (run_non_elevated(action_runner_path, params, pidBuffer))
+                Logger::warn(L"RunNonElevatedEx() failed. Trying fallback");
+                std::wstring action_runner_path = get_module_folderpath() + L"\\PowerToys.ActionRunner.exe";
+                std::wstring newParams = L"-run-non-elevated -target modules\\launcher\\PowerToys.PowerLauncher.exe " + params;
+                if (run_non_elevated(action_runner_path, newParams, nullptr))
                 {
+                    processStarted = true;
                     Logger::trace("Started PowerToys Run Process");
-                    m_enabled = true;
-                    const int maxRetries = 80;
-                    for (int retry = 0; retry < maxRetries; ++retry)
-                    {
-                        Sleep(50);
-                        DWORD pid = *pidBuffer;
-                        if (pid)
-                        {
-                            m_hProcess = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | SYNCHRONIZE, FALSE, pid);
-                            Logger::trace("Opened PowerToys Run Process. Handle {}", m_hProcess);
-                            break;
-                        }
-                    }
                 }
                 else
                 {
-                    Logger::error("Failed to start PowerToys Run");
+                    Logger::warn("Failed to start PowerToys Run");
                 }
             }
-            CloseHandle(hMapFile);
         }
+        processStarting = false;
+        m_enabled = true;
+        Logger::info("Microsoft_Launcher::enable() end");
     }
 
     // Disable the powertoy
@@ -294,9 +295,11 @@ public:
         Logger::info("Launcher is disabling");
         if (m_enabled)
         {
+            TerminateRunningInstance();
+            processStarted = false;
             ResetEvent(m_hEvent);
+            ResetEvent(m_hCentralizedKeyboardHookEvent);
             ResetEvent(send_telemetry_event);
-            terminateProcess();
         }
 
         m_enabled = false;
@@ -332,15 +335,19 @@ public:
         // For now, hotkeyId will always be zero
         if (m_enabled)
         {
-            if (WaitForSingleObject(m_hProcess, 0) == WAIT_OBJECT_0)
+            if (!processStarted)
             {
-                Logger::warn("PowerToys Run has exited unexpectedly, restarting PowerToys Run.");
+                Logger::warn("PowerToys Run hasn't been started. Starting PowerToys Run");
                 enable();
             }
 
-            Logger::trace("Set POWER_LAUNCHER_SHARED_EVENT. Handle {}", m_hProcess);
-            SetEvent(m_hEvent);
-            return true;
+            /* Now, PowerToys Run uses a global hotkey so that it can get focus.
+             * Activate it with the centralized keyboard hook only if the setting is on.*/
+            if (m_use_centralized_keyboard_hook) {
+                Logger::trace("Set POWER_LAUNCHER_SHARED_EVENT");
+                SetEvent(m_hCentralizedKeyboardHookEvent);
+                return true;
+            }
         }
 
         return false;
@@ -356,34 +363,6 @@ public:
             ::PostMessage(nextWindow, WM_CLOSE, 0, 0);
 
         return true;
-    }
-
-    // Terminate process by sending WM_CLOSE signal and if it fails, force terminate.
-    void terminateProcess()
-    {
-        Logger::trace(L"Terminating PowerToys Run process. Handle {}.", m_hProcess);
-        if (WaitForSingleObject(m_hProcess, 0) == WAIT_OBJECT_0)
-        {
-            Logger::warn("PowerToys Run has exited unexpectedly, so there is no need to terminate it.");
-            return;
-        }
-
-        DWORD processID = GetProcessId(m_hProcess);
-        if (TerminateProcess(m_hProcess, 1) == 0)
-        {
-            auto err = get_last_error_message(GetLastError());
-            Logger::error(L"Launcher process was not terminated. {}", err.has_value() ? err.value() : L"");
-        }
-
-        // Temporarily disable sending a message to close
-        /*
-        EnumWindows(&requestMainWindowClose, processID);
-        const DWORD result = WaitForSingleObject(m_hProcess, MAX_WAIT_MILLISEC);
-        if (result == WAIT_TIMEOUT || result == WAIT_FAILED)
-        {
-            TerminateProcess(m_hProcess, 1);
-        }
-        */
     }
 
     virtual void send_settings_telemetry() override
@@ -412,6 +391,7 @@ void Microsoft_Launcher::init_settings()
 
 void Microsoft_Launcher::parse_hotkey(PowerToysSettings::PowerToyValues& settings)
 {
+    m_use_centralized_keyboard_hook = false;
     auto settingsObject = settings.get_raw_json();
     if (settingsObject.GetView().Size())
     {
@@ -427,6 +407,15 @@ void Microsoft_Launcher::parse_hotkey(PowerToysSettings::PowerToyValues& setting
         catch(...)
         {
             Logger::error("Failed to initialize PT Run start shortcut");
+        }
+        try
+        {
+            auto jsonPropertiesObject = settingsObject.GetNamedObject(JSON_KEY_PROPERTIES);
+            m_use_centralized_keyboard_hook = (bool)jsonPropertiesObject.GetNamedBoolean(JSON_KEY_USE_CENTRALIZED_KEYBOARD_HOOK);
+        }
+        catch (...)
+        {
+            Logger::warn("Failed to get centralized keyboard hook setting");
         }
     }
     else

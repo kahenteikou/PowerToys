@@ -10,20 +10,10 @@
 
 #include "XmlDocumentEx.h"
 
+extern std::vector<std::wstring> processes;
+
 namespace
 {
-    std::vector<std::wstring> processes = 
-    {
-        L"PowerToys.exe",
-        L"ColorPickerUI.exe",
-        L"PowerToys.Espresso.exe"
-        L"FancyZonesEditor.exe",
-        L"PowerToys.KeyboardManagerEngine.exe",
-        L"PowerToys.KeyboardManagerEditor.exe",
-        L"PowerLauncher.exe",
-        L"PowerToys.ShortcutGuide.exe"
-    };
-
     // Batch size for number of events queried at once
     constexpr int BATCH_SIZE = 50;
 

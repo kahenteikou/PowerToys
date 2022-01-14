@@ -6,7 +6,6 @@
 #include <common/SettingsAPI/settings_helpers.h>
 #include "powertoy_module.h"
 #include <common/themes/windows_colors.h>
-#include <common/winstore/winstore.h>
 
 #include "trace.h"
 #include <common/utils/elevation.h>
@@ -15,6 +14,7 @@
 
 // TODO: would be nice to get rid of these globals, since they're basically cached json settings
 static std::wstring settings_theme = L"system";
+static bool startup_disabled_manually = false;
 static bool run_as_elevated = false;
 static bool download_updates_automatically = true;
 
@@ -22,7 +22,6 @@ json::JsonObject GeneralSettings::to_json()
 {
     json::JsonObject result;
 
-    result.SetNamedValue(L"packaged", json::value(isPackaged));
     result.SetNamedValue(L"startup", json::value(isStartupEnabled));
     if (!startupDisabledReason.empty())
     {
@@ -65,7 +64,6 @@ GeneralSettings get_general_settings()
 {
     const bool is_user_admin = check_user_is_admin();
     GeneralSettings settings{
-        .isPackaged = winstore::running_as_packaged(),
         .isElevated = is_process_elevated(),
         .isRunElevated = run_as_elevated,
         .isAdmin = is_user_admin,
@@ -75,31 +73,7 @@ GeneralSettings get_general_settings()
         .powerToysVersion = get_product_version()
     };
 
-    if (winstore::running_as_packaged())
-    {
-        const auto task_state = winstore::get_startup_task_status_async().get();
-        switch (task_state)
-        {
-        case winstore::StartupTaskState::Disabled:
-            settings.isStartupEnabled = false;
-            break;
-        case winstore::StartupTaskState::Enabled:
-            settings.isStartupEnabled = true;
-            break;
-        case winstore::StartupTaskState::DisabledByPolicy:
-            settings.startupDisabledReason = GET_RESOURCE_STRING(IDS_STARTUP_DISABLED_BY_POLICY);
-            settings.isStartupEnabled = false;
-            break;
-        case winstore::StartupTaskState::DisabledByUser:
-            settings.startupDisabledReason = GET_RESOURCE_STRING(IDS_STARTUP_DISABLED_BY_USER);
-            settings.isStartupEnabled = false;
-            break;
-        }
-    }
-    else
-    {
-        settings.isStartupEnabled = is_auto_start_task_active_for_this_user();
-    }
+    settings.isStartupEnabled = is_auto_start_task_active_for_this_user();
 
     for (auto& [name, powertoy] : modules())
     {
@@ -118,39 +92,46 @@ void apply_general_settings(const json::JsonObject& general_configs, bool save)
     if (json::has(general_configs, L"startup", json::JsonValueType::Boolean))
     {
         const bool startup = general_configs.GetNamedBoolean(L"startup");
-        if (winstore::running_as_packaged())
-        {
-            winstore::switch_startup_task_state_async(startup).wait();
-        }
-        else
-        {
-            if (startup)
-            {
-                if (is_process_elevated())
-                {
-                    delete_auto_start_task_for_this_user();
-                    create_auto_start_task_for_this_user(general_configs.GetNamedBoolean(L"run_elevated", false));
-                }
-                else
-                {
-                    if (!is_auto_start_task_active_for_this_user())
-                    {
-                        delete_auto_start_task_for_this_user();
-                        create_auto_start_task_for_this_user(false);
 
-                        run_as_elevated = false;
-                    }
-                    else if (!general_configs.GetNamedBoolean(L"run_elevated", false))
-                    {
-                        delete_auto_start_task_for_this_user();
-                        create_auto_start_task_for_this_user(false);
-                    }
+        auto settings = get_general_settings();
+        static std::once_flag once_flag;
+        std::call_once(once_flag, [settings, startup, general_configs] {
+            if (json::has(general_configs, L"startup", json::JsonValueType::Boolean))
+            {
+                if (startup == true && settings.isStartupEnabled == false)
+                {
+                    startup_disabled_manually = true;
                 }
+            }
+        });
+
+        if (startup && !startup_disabled_manually)
+        {
+            if (is_process_elevated())
+            {
+                delete_auto_start_task_for_this_user();
+                create_auto_start_task_for_this_user(general_configs.GetNamedBoolean(L"run_elevated", false));
             }
             else
             {
-                delete_auto_start_task_for_this_user();
+                if (!is_auto_start_task_active_for_this_user())
+                {
+                    delete_auto_start_task_for_this_user();
+                    create_auto_start_task_for_this_user(false);
+
+                    run_as_elevated = false;
+                }
+                else if (!general_configs.GetNamedBoolean(L"run_elevated", false))
+                {
+                    delete_auto_start_task_for_this_user();
+                    create_auto_start_task_for_this_user(false);
+                }
             }
+        }
+        else
+        {
+            delete_auto_start_task_for_this_user();
+            startup_disabled_manually = false;
         }
     }
     if (json::has(general_configs, L"enabled"))
@@ -198,9 +179,15 @@ void apply_general_settings(const json::JsonObject& general_configs, bool save)
     }
 }
 
-void start_initial_powertoys()
+void start_enabled_powertoys()
 {
     std::unordered_set<std::wstring> powertoys_to_disable;
+    // Take into account default values supplied by modules themselves
+    for (auto& [name, powertoy] : modules())
+    {
+        if (!powertoy->is_enabled_by_default())
+            powertoys_to_disable.emplace(name);
+    }
 
     json::JsonObject general_settings;
     try
@@ -211,9 +198,16 @@ void start_initial_powertoys()
             json::JsonObject enabled = general_settings.GetNamedObject(L"enabled");
             for (const auto& disabled_element : enabled)
             {
+                std::wstring disable_module_name{ static_cast<std::wstring_view>(disabled_element.Key()) };
+                // Disable explicitly disabled modules
                 if (!disabled_element.Value().GetBoolean())
                 {
-                    powertoys_to_disable.emplace(disabled_element.Key());
+                    powertoys_to_disable.emplace(std::move(disable_module_name));
+                }
+                // If module was scheduled for disable, but it's enabled in the settings - override default value
+                else if (auto it = powertoys_to_disable.find(disable_module_name); it != end(powertoys_to_disable))
+                {
+                    powertoys_to_disable.erase(it);
                 }
             }
         }
@@ -222,21 +216,11 @@ void start_initial_powertoys()
     {
     }
 
-    if (powertoys_to_disable.empty())
+    for (auto& [name, powertoy] : modules())
     {
-        for (auto& [name, powertoy] : modules())
+        if (!powertoys_to_disable.contains(name))
         {
             powertoy->enable();
-        }
-    }
-    else
-    {
-        for (auto& [name, powertoy] : modules())
-        {
-            if (powertoys_to_disable.find(name) == powertoys_to_disable.end())
-            {
-                powertoy->enable();
-            }
         }
     }
 }

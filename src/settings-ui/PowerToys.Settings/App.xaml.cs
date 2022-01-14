@@ -18,11 +18,17 @@ namespace PowerToys.Settings
 
         public bool ShowOobe { get; set; }
 
+        public Type StartupPage { get; set; } = typeof(Microsoft.PowerToys.Settings.UI.Views.GeneralPage);
+
         public void OpenSettingsWindow(Type type)
         {
             if (settingsWindow == null)
             {
                 settingsWindow = new MainWindow();
+            }
+            else if (settingsWindow.WindowState == WindowState.Minimized)
+            {
+                settingsWindow.WindowState = WindowState.Normal;
             }
 
             settingsWindow.Show();
@@ -43,6 +49,7 @@ namespace PowerToys.Settings
             {
                 settingsWindow = new MainWindow();
                 settingsWindow.Show();
+                settingsWindow.NavigateToSection(StartupPage);
             }
             else
             {

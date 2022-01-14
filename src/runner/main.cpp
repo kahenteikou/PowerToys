@@ -2,6 +2,7 @@
 #include <ShellScalingApi.h>
 #include <lmcons.h>
 #include <filesystem>
+#include <sstream>
 #include "tray_icon.h"
 #include "powertoy_module.h"
 #include "trace.h"
@@ -20,19 +21,19 @@
 #include <common/updating/updateState.h>
 #include <common/utils/appMutex.h>
 #include <common/utils/elevation.h>
+#include <common/utils/os-detect.h>
 #include <common/utils/processApi.h>
 #include <common/utils/resources.h>
-#include <common/winstore/winstore.h>
 
-#include "update_utils.h"
-#include "action_runner_utils.h"
+#include "UpdateUtils.h"
+#include "ActionRunnerUtils.h"
 
 #include <winrt/Windows.System.h>
 
 #include <Psapi.h>
 #include <RestartManager.h>
 #include "centralized_kb_hook.h"
-#include "CentralizedHotkeys.h"
+#include "centralized_hotkeys.h"
 
 #if _DEBUG && _WIN64
 #include "unhandled_exception_handler.h"
@@ -44,8 +45,7 @@
 #include <common/utils/winapi_error.h>
 #include <common/utils/window.h>
 #include <common/version/version.h>
-
-extern updating::notifications::strings Strings;
+#include <gdiplus.h>
 
 namespace
 {
@@ -70,15 +70,15 @@ inline wil::unique_mutex_nothrow create_msi_mutex()
     return createAppMutex(POWERTOYS_MSI_MUTEX_NAME);
 }
 
-inline wil::unique_mutex_nothrow create_msix_mutex()
-{
-    return createAppMutex(POWERTOYS_MSIX_MUTEX_NAME);
-}
-
-void open_menu_from_another_instance()
+void open_menu_from_another_instance(std::optional<std::string> settings_window)
 {
     const HWND hwnd_main = FindWindowW(L"PToyTrayIconWindow", nullptr);
-    PostMessageW(hwnd_main, WM_COMMAND, ID_SETTINGS_MENU_COMMAND, 0);
+    LPARAM msg = static_cast<LPARAM>(ESettingsWindowNames::Overview);
+    if (settings_window.has_value())
+    {
+        msg = static_cast<LPARAM>(ESettingsWindowNames_from_string(settings_window.value()));
+    }
+    PostMessageW(hwnd_main, WM_COMMAND, ID_SETTINGS_MENU_COMMAND, msg);
 }
 
 void debug_verify_launcher_assets()
@@ -105,7 +105,7 @@ void debug_verify_launcher_assets()
     }
 }
 
-int runner(bool isProcessElevated, bool openSettings, bool openOobe)
+int runner(bool isProcessElevated, bool openSettings, std::string settingsWindow, bool openOobe)
 {
     Logger::info("Runner is starting. Elevated={}", isProcessElevated);
     DPIAware::EnableDPIAwarenessForThisProcess();
@@ -125,41 +125,40 @@ int runner(bool isProcessElevated, bool openSettings, bool openOobe)
         debug_verify_launcher_assets();
 
         std::thread{ [] {
-            periodic_update_worker();
+            PeriodicUpdateWorker();
         } }.detach();
 
-        if (winstore::running_as_packaged())
-        {
-            std::thread{ [] {
-                start_msi_uninstallation_sequence();
-            } }.detach();
-        }
-        else
-        {
-            std::thread{ [] {
-                if (updating::uninstall_previous_msix_version_async().get())
-                {
-                    notifications::show_toast(GET_RESOURCE_STRING(IDS_OLDER_MSIX_UNINSTALLED).c_str(), L"PowerToys");
-                }
-            } }.detach();
-        }
-
-        notifications::register_background_toast_handler();
+        std::thread{ [] {
+            if (updating::uninstall_previous_msix_version_async().get())
+            {
+                notifications::show_toast(GET_RESOURCE_STRING(IDS_OLDER_MSIX_UNINSTALLED).c_str(), L"PowerToys");
+            }
+        } }.detach();
 
         chdir_current_executable();
         // Load Powertoys DLLs
 
-        const std::array<std::wstring_view, 9> knownModules = {
-            L"modules/FancyZones/fancyzones.dll",
-            L"modules/FileExplorerPreview/powerpreview.dll",
-            L"modules/ImageResizer/ImageResizerExt.dll",
-            L"modules/KeyboardManager/KeyboardManager.dll",
-            L"modules/Launcher/Microsoft.Launcher.dll",
-            L"modules/PowerRename/PowerRenameExt.dll",
-            L"modules/ShortcutGuide/ShortcutGuideModuleInterface/ShortcutGuideModuleInterface.dll",
-            L"modules/ColorPicker/ColorPicker.dll",
-            L"modules/Espresso/EspressoModuleInterface.dll",
+        std::vector<std::wstring_view> knownModules = {
+            L"modules/FancyZones/PowerToys.FancyZonesModuleInterface.dll",
+            L"modules/FileExplorerPreview/PowerToys.powerpreview.dll",
+            L"modules/ImageResizer/PowerToys.ImageResizerExt.dll",
+            L"modules/KeyboardManager/PowerToys.KeyboardManager.dll",
+            L"modules/Launcher/PowerToys.Launcher.dll",
+            L"modules/PowerRename/PowerToys.PowerRenameExt.dll",
+            L"modules/ShortcutGuide/ShortcutGuideModuleInterface/PowerToys.ShortcutGuideModuleInterface.dll",
+            L"modules/ColorPicker/PowerToys.ColorPicker.dll",
+            L"modules/Awake/PowerToys.AwakeModuleInterface.dll",
+            L"modules/MouseUtils/PowerToys.FindMyMouse.dll" ,
+            L"modules/MouseUtils/PowerToys.MouseHighlighter.dll",
+            L"modules/AlwaysOnTop/PowerToys.AlwaysOnTopModuleInterface.dll",
+
         };
+        const auto VCM_PATH = L"modules/VideoConference/PowerToys.VideoConferenceModule.dll";
+        if (const auto mf = LoadLibraryA("mf.dll"))
+        {
+            FreeLibrary(mf);
+            knownModules.emplace_back(VCM_PATH);
+        }
 
         for (const auto& moduleSubdir : knownModules)
         {
@@ -179,13 +178,18 @@ int runner(bool isProcessElevated, bool openSettings, bool openOobe)
             }
         }
         // Start initial powertoys
-        start_initial_powertoys();
+        start_enabled_powertoys();
 
         Trace::EventLaunch(get_product_version(), isProcessElevated);
 
         if (openSettings)
         {
-            open_settings_window();
+            std::optional<std::wstring> window;
+            if (!settingsWindow.empty())
+            {
+                window = winrt::to_hstring(settingsWindow);
+            }
+            open_settings_window(window);
         }
 
         if (openOobe)
@@ -263,7 +267,7 @@ toast_notification_handler_result toast_notification_handler(const std::wstring_
     else if (param.starts_with(update_now))
     {
         std::wstring args{ cmdArg::UPDATE_NOW_LAUNCH_STAGE1 };
-        launch_action_runner(args.c_str());
+        LaunchPowerToysUpdate(args.c_str());
         return toast_notification_handler_result::exit_success;
     }
     else if (param == couldnt_toggle_powerpreview_modules_disable)
@@ -272,7 +276,7 @@ toast_notification_handler_result toast_notification_handler(const std::wstring_
     }
     else if (param == open_settings)
     {
-        open_menu_from_another_instance();
+        open_menu_from_another_instance(std::nullopt);
         return toast_notification_handler_result::exit_success;
     }
     else
@@ -283,6 +287,10 @@ toast_notification_handler_result toast_notification_handler(const std::wstring_
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
+    Gdiplus::GdiplusStartupInput gpStartupInput;
+    ULONG_PTR gpToken;
+    GdiplusStartup(&gpToken, &gpStartupInput, NULL);
+
     winrt::init_apartment();
     const wchar_t* securityDescriptor =
         L"O:BA" // Owner: Builtin (local) administrator
@@ -330,69 +338,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     logFilePath.append(LogSettings::runnerLogPath);
     Logger::init(LogSettings::runnerLoggerName, logFilePath.wstring(), PTSettingsHelper::get_log_settings_file_location());
 
-    wil::unique_mutex_nothrow msi_mutex;
-    wil::unique_mutex_nothrow msix_mutex;
-
-    if (winstore::running_as_packaged())
+    const std::string cmdLine{ lpCmdLine };
+    auto open_settings_it = cmdLine.find("--open-settings");
+    const bool open_settings = open_settings_it != std::string::npos;
+    // Check if opening specific settings window
+    open_settings_it = cmdLine.find("--open-settings=");
+    std::string settings_window;
+    if (open_settings_it != std::string::npos)
     {
-        msix_mutex = create_msix_mutex();
-        if (!msix_mutex)
-        {
-            // The MSIX version is already running.
-            open_menu_from_another_instance();
-            return 0;
-        }
-
-        // Check if the MSI version is running, if not, hold the
-        // mutex to prevent the old MSI versions to start.
-        msi_mutex = create_msi_mutex();
-        if (!msi_mutex)
-        {
-            // The MSI version is running, warn the user and offer to uninstall it.
-            const bool declined_uninstall = !start_msi_uninstallation_sequence();
-            if (declined_uninstall)
-            {
-                // Check again if the MSI version is still running.
-                msi_mutex = create_msi_mutex();
-                if (!msi_mutex)
-                {
-                    open_menu_from_another_instance();
-                    return 0;
-                }
-            }
-        }
-        else
-        {
-            // Older MSI versions are not aware of the MSIX mutex, therefore
-            // hold the MSI mutex to prevent an old instance to start.
-        }
+        std::string rest_of_cmd_line{ cmdLine, open_settings_it + std::string{ "--open-settings=" }.size() };
+        std::istringstream iss(rest_of_cmd_line);
+        iss >> settings_window;
     }
-    else
-    {
-        // Check if another instance of the MSI version is already running.
-        msi_mutex = create_msi_mutex();
-        if (!msi_mutex)
-        {
-            // The MSI version is already running.
-            open_menu_from_another_instance();
-            return 0;
-        }
 
-        // Check if an instance of the MSIX version is already running.
-        // Note: this check should always be negative since the MSIX version
-        // is holding both mutexes.
-        msix_mutex = create_msix_mutex();
-        if (!msix_mutex)
-        {
-            // The MSIX version is already running.
-            open_menu_from_another_instance();
-            return 0;
-        }
-        else
-        {
-            // The MSIX version isn't running, release the mutex.
-            msix_mutex.reset(nullptr);
-        }
+    // Check if another instance is already running.
+    wil::unique_mutex_nothrow msi_mutex = create_msi_mutex();
+    if (!msi_mutex)
+    {
+        open_menu_from_another_instance(settings_window);
+        return 0;
     }
 
     bool openOobe = false;
@@ -417,7 +381,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         modules();
 
         auto general_settings = load_general_settings();
-        const bool openSettings = std::string(lpCmdLine).find("--open-settings") != std::string::npos;
 
         // Apply the general settings but don't save it as the modules() variable has not been loaded yet
         apply_general_settings(general_settings, false);
@@ -425,13 +388,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         const bool elevated = is_process_elevated();
         if ((elevated ||
              general_settings.GetNamedBoolean(L"run_elevated", false) == false ||
-             std::string(lpCmdLine).find("--dont-elevate") != std::string::npos))
+             cmdLine.find("--dont-elevate") != std::string::npos))
         {
-            result = runner(elevated, openSettings, openOobe);
+            result = runner(elevated, open_settings, settings_window, openOobe);
         }
         else
         {
-            schedule_restart_as_elevated(openSettings);
+            schedule_restart_as_elevated(open_settings);
             result = 0;
         }
     }
@@ -442,15 +405,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         result = -1;
     }
 
+    // Save settings on closing
+    auto general_settings = load_general_settings();
+    apply_general_settings(general_settings);
+
     // We need to release the mutexes to be able to restart the application
     if (msi_mutex)
     {
         msi_mutex.reset(nullptr);
-    }
-
-    if (msix_mutex)
-    {
-        msix_mutex.reset(nullptr);
     }
 
     if (is_restart_scheduled())

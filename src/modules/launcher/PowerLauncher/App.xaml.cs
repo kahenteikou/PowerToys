@@ -6,11 +6,12 @@ using System;
 using System.Diagnostics;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Windows;
+using Common.UI;
 using interop;
 using ManagedCommon;
 using Microsoft.PowerLauncher.Telemetry;
-using Microsoft.PowerToys.Common.UI;
 using Microsoft.PowerToys.Telemetry;
 using PowerLauncher.Helper;
 using PowerLauncher.Plugin;
@@ -39,44 +40,62 @@ namespace PowerLauncher
         private StringMatcher _stringMatcher;
         private SettingsReader _settingsReader;
 
+        // To prevent two disposals running at the same time.
+        private static readonly object _disposingLock = new object();
+
         [STAThread]
         public static void Main()
         {
             Log.Info($"Starting PowerToys Run with PID={Process.GetCurrentProcess().Id}", typeof(App));
-            if (SingleInstance<App>.InitializeAsFirstInstance())
+            int powerToysPid = GetPowerToysPId();
+            if (powerToysPid != 0)
             {
-                using (var application = new App())
-                {
-                    application.InitializeComponent();
-                    NativeEventWaiter.WaitForEventLoop(Constants.RunExitEvent(), () =>
-                    {
-                        Log.Warn("RunExitEvent was signaled. Exiting PowerToys", typeof(App));
-                        ExitPowerToys(application);
-                    });
-
-                    int powerToysPid = GetPowerToysPId();
-                    if (powerToysPid != 0)
-                    {
-                        Log.Info($"Runner pid={powerToysPid}", typeof(App));
-                        RunnerHelper.WaitForPowerToysRunner(powerToysPid, () =>
-                        {
-                            Log.Info($"Runner with pid={powerToysPid} exited. Exiting PowerToys Run", typeof(App));
-                            ExitPowerToys(application);
-                        });
-                    }
-
-                    application.Run();
-                }
+                // The process started from the PT Run module interface. One instance is handled there.
+                Log.Info($"Runner pid={powerToysPid}", typeof(App));
+                SingleInstance<App>.CreateInstanceMutex();
             }
             else
             {
-                Log.Error("There is already running PowerToys Run instance. Exiting PowerToys Run", typeof(App));
+                // If PT Run is started as standalone application check if there is already running instance
+                if (!SingleInstance<App>.InitializeAsFirstInstance())
+                {
+                    Log.Warn("There is already running PowerToys Run instance. Exiting PowerToys Run", typeof(App));
+                    return;
+                }
+            }
+
+            using (var application = new App())
+            {
+                application.InitializeComponent();
+                new Thread(() =>
+                {
+                    var eventHandle = new EventWaitHandle(false, EventResetMode.AutoReset, Constants.RunExitEvent());
+                    if (eventHandle.WaitOne())
+                    {
+                        Log.Warn("RunExitEvent was signaled. Exiting PowerToys", typeof(App));
+                        ExitPowerToys(application);
+                    }
+                }).Start();
+
+                if (powerToysPid != 0)
+                {
+                    RunnerHelper.WaitForPowerToysRunner(powerToysPid, () =>
+                    {
+                        Log.Info($"Runner with pid={powerToysPid} exited. Exiting PowerToys Run", typeof(App));
+                        ExitPowerToys(application);
+                    });
+                }
+
+                application.Run();
             }
         }
 
         private void OnStartup(object sender, StartupEventArgs e)
         {
             Log.Info("On Startup.", GetType());
+
+            // Fix for .net 3.1.19 making PowerToys Run not adapt to DPI changes.
+            PowerLauncher.Helper.NativeMethods.SetProcessDPIAware();
             var bootTime = new System.Diagnostics.Stopwatch();
             bootTime.Start();
             Stopwatch.Normal("App.OnStartup - Startup cost", () =>
@@ -93,7 +112,7 @@ namespace PowerLauncher
 
                 _settingsVM = new SettingWindowViewModel();
                 _settings = _settingsVM.Settings;
-                _settings.UsePowerToysRunnerKeyboardHook = e.Args.Contains("--centralized-kb-hook");
+                _settings.StartedFromPowerToysRunner = e.Args.Contains("--started-from-runner");
 
                 _stringMatcher = new StringMatcher();
                 StringMatcher.Instance = _stringMatcher;
@@ -170,9 +189,23 @@ namespace PowerLauncher
 
         private void RegisterExitEvents()
         {
-            AppDomain.CurrentDomain.ProcessExit += (s, e) => Dispose();
-            Current.Exit += (s, e) => Dispose();
-            Current.SessionEnding += (s, e) => Dispose();
+            AppDomain.CurrentDomain.ProcessExit += (s, e) =>
+            {
+                Log.Info("AppDomain.CurrentDomain.ProcessExit", GetType());
+                Dispose();
+            };
+
+            Current.Exit += (s, e) =>
+            {
+                Log.Info("Application.Current.Exit", GetType());
+                Dispose();
+            };
+
+            Current.SessionEnding += (s, e) =>
+            {
+                Log.Info("Application.Current.SessionEnding", GetType());
+                Dispose();
+            };
         }
 
         /// <summary>
@@ -211,33 +244,44 @@ namespace PowerLauncher
 
         protected virtual void Dispose(bool disposing)
         {
-            if (!_disposed)
+            // Prevent two disposes at the same time.
+            lock (_disposingLock)
             {
-                Stopwatch.Normal("App.OnExit - Exit cost", () =>
+                if (!disposing)
                 {
-                    Log.Info("Start PowerToys Run Exit----------------------------------------------------  ", GetType());
-                    if (disposing)
-                    {
-                        if (_themeManager != null)
-                        {
-                            _themeManager.ThemeChanged -= OnThemeChanged;
-                        }
+                    return;
+                }
 
-                        API?.SaveAppAllSettings();
-                        PluginManager.Dispose();
-                        _mainWindow?.Dispose();
-                        API?.Dispose();
-                        _mainVM?.Dispose();
-                        _themeManager?.Dispose();
-                        _disposed = true;
+                if (_disposed)
+                {
+                    return;
+                }
+
+                _disposed = true;
+            }
+
+            Stopwatch.Normal("App.OnExit - Exit cost", () =>
+            {
+                Log.Info("Start PowerToys Run Exit----------------------------------------------------  ", GetType());
+                if (disposing)
+                {
+                    if (_themeManager != null)
+                    {
+                        _themeManager.ThemeChanged -= OnThemeChanged;
                     }
 
-                    // TODO: free unmanaged resources (unmanaged objects) and override finalizer
-                    // TODO: set large fields to null
-                    _disposed = true;
-                    Log.Info("End PowerToys Run Exit ----------------------------------------------------  ", GetType());
-                });
-            }
+                    API?.SaveAppAllSettings();
+                    PluginManager.Dispose();
+                    _mainWindow?.Dispose();
+                    API?.Dispose();
+                    _mainVM?.Dispose();
+                    _themeManager?.Dispose();
+                }
+
+                // TODO: free unmanaged resources (unmanaged objects) and override finalizer
+                // TODO: set large fields to null
+                Log.Info("End PowerToys Run Exit ----------------------------------------------------  ", GetType());
+            });
         }
 
         // // TODO: override finalizer only if 'Dispose(bool disposing)' has code to free unmanaged resources
